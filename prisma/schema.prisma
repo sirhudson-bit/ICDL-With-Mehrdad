@@ -1,0 +1,576 @@
+// ICDL With Mehrdad — data model
+//
+// Portability notes
+// ─────────────────
+// The development database is SQLite so the platform runs with zero setup,
+// and the schema is written to be PostgreSQL-ready. To move to PostgreSQL:
+//   1. change `provider` below to "postgresql"
+//   2. point DATABASE_URL at your server
+//   3. run `npm run db:migrate`
+//
+// Two deliberate constraints keep this switch painless:
+//   • No `enum` declarations — SQLite does not support them, so every
+//     enumerated value is a `String` narrowed by TypeScript unions and Zod
+//     schemas in src/lib/validation. Values are validated on write.
+//   • No native type attributes (`@db.Text`, `@db.VarChar`, ...) — they are
+//     provider specific. Plain `String` maps to TEXT on PostgreSQL.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Identity
+// ─────────────────────────────────────────────────────────────
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  name         String
+  passwordHash String
+  // "ADMIN" | "LEARNER"
+  role         String    @default("LEARNER")
+  avatarUrl    String?
+  bio          String?
+  isActive     Boolean   @default(true)
+
+  // Lightweight engagement tracking
+  streakCount      Int       @default(0)
+  lastStreakDate   DateTime?
+  lastActiveAt     DateTime  @default(now())
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sessions      Session[]
+  progress      UserProgress[]
+  quizAttempts  QuizAttempt[]
+  bookmarks     Bookmark[]
+  searchHistory SearchHistory[]
+  chatSessions  ChatSession[]
+  uploads       Media[]
+  activities    ActivityLog[]
+  certificates  Certificate[]
+  messages      ContactMessage[]
+  courseRequests CourseRequest[]
+  passwordResets PasswordResetToken[]
+
+  @@index([role])
+  @@index([isActive])
+  @@index([lastActiveAt])
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  // Opaque random token stored hashed-at-rest by the session service
+  token     String   @unique
+  userId    String
+  expiresAt DateTime
+  userAgent String?
+  ipAddress String?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Course structure: Module → Chapter → Lesson
+// ─────────────────────────────────────────────────────────────
+
+model Module {
+  id       String @id @default(cuid())
+  slug     String @unique
+  // Curriculum number as published: 0 = آشنایی اولیه, 1..8 thematic modules
+  number   Int
+  title    String
+  subtitle String?
+  description  String
+  icon     String  @default("BookOpen")
+  // Token name resolved to a static class map in the UI layer
+  color    String  @default("brand")
+  // Curriculum strand this module belongs to, e.g. "office". Group metadata
+  // (title, icon, order) lives in src/lib/topics.ts so the taxonomy can evolve
+  // without a migration.
+  group    String  @default("fundamentals")
+  estimatedMinutes Int @default(0)
+  isPublished Boolean @default(true)
+  order    Int
+
+  // Normalised haystack (Persian-aware) used by the search layer
+  searchText String @default("")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  chapters Chapter[]
+  bookmarks Bookmark[]
+
+  @@index([order])
+  @@index([isPublished])
+}
+
+model Chapter {
+  id          String  @id @default(cuid())
+  moduleId    String
+  slug        String  @unique
+  title       String
+  description String?
+  order       Int
+  isPublished Boolean @default(true)
+
+  searchText String @default("")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  module  Module   @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+  lessons Lesson[]
+
+  @@index([moduleId])
+  @@index([order])
+}
+
+model Lesson {
+  id        String @id @default(cuid())
+  chapterId String
+  slug      String @unique
+  title     String
+  summary   String
+  // Comma separated synonyms that should match this lesson in search
+  keywords  String @default("")
+
+  order            Int
+  estimatedMinutes Int    @default(10)
+  // "BEGINNER" | "INTERMEDIATE" | "ADVANCED"
+  difficulty       String @default("BEGINNER")
+
+  isPublished Boolean  @default(true)
+  publishedAt DateTime?
+
+  // SEO
+  seoTitle       String?
+  seoDescription String?
+  ogImageUrl     String?
+
+  // Normalised haystack (title, summary, keywords, block text)
+  searchText String @default("")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  chapter      Chapter       @relation(fields: [chapterId], references: [id], onDelete: Cascade)
+  blocks       LessonBlock[]
+  quiz         Quiz?
+  faqs         Faq[]
+  progress     UserProgress[]
+  bookmarks    Bookmark[]
+  chatSessions ChatSession[]
+
+  @@index([chapterId])
+  @@index([order])
+  @@index([isPublished])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Lesson content — a lesson is an ordered list of typed blocks
+// ─────────────────────────────────────────────────────────────
+
+model LessonBlock {
+  id       String @id @default(cuid())
+  lessonId String
+  // BlockType union, see src/lib/content/blocks.ts
+  type     String
+  order    Int
+  // Kind-specific payload, validated by the matching Zod schema before write
+  data     Json
+  isVisible Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  lesson Lesson @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+
+  @@index([lessonId])
+  @@index([lessonId, order])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Assessment
+// ─────────────────────────────────────────────────────────────
+
+model Quiz {
+  id          String  @id @default(cuid())
+  lessonId    String  @unique
+  title       String
+  description String?
+  passingScore Int    @default(70)
+  timeLimitMinutes Int?
+  isPublished Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  lesson    Lesson        @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  questions Question[]
+  attempts  QuizAttempt[]
+
+  @@index([lessonId])
+}
+
+model Question {
+  id          String  @id @default(cuid())
+  quizId      String
+  // "MULTIPLE_CHOICE" | "TRUE_FALSE" | "FILL_BLANK" | "MATCHING" | "PRACTICAL"
+  type        String
+  prompt      String
+  hint        String?
+  explanation String?
+  points      Int     @default(1)
+  order       Int
+  // Kind-specific payload (options, accepted answers, pairs, ...)
+  data        Json
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  quiz Quiz @relation(fields: [quizId], references: [id], onDelete: Cascade)
+
+  @@index([quizId])
+  @@index([quizId, order])
+}
+
+model QuizAttempt {
+  id              String @id @default(cuid())
+  userId          String
+  quizId          String
+  score           Int
+  maxScore        Int
+  correctCount    Int    @default(0)
+  totalCount      Int    @default(0)
+  passed          Boolean @default(false)
+  durationSeconds Int?
+  // Array of { questionId, value, correct }
+  answers         Json
+
+  startedAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  quiz Quiz @relation(fields: [quizId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([quizId])
+  @@index([completedAt])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Learner state
+// ─────────────────────────────────────────────────────────────
+
+model UserProgress {
+  id       String @id @default(cuid())
+  userId   String
+  lessonId String
+  // "NOT_STARTED" | "IN_PROGRESS" | "COMPLETED"
+  status   String @default("NOT_STARTED")
+  // 0..100, derived from completed steps / visited blocks
+  percent  Int    @default(0)
+  // Reserved for per-step completion tracking
+  completedSteps Json?
+
+  lastViewedAt DateTime  @default(now())
+  startedAt    DateTime  @default(now())
+  completedAt  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lesson Lesson @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, lessonId])
+  @@index([userId, status])
+  @@index([userId, lastViewedAt])
+  @@index([lessonId])
+}
+
+model Bookmark {
+  id     String @id @default(cuid())
+  userId String
+  // "LESSON" | "MODULE" | "TIP" | "DEFINITION" | "EXERCISE"
+  type   String @default("LESSON")
+
+  // A favourite may point at a whole module, a single lesson, or a block inside
+  // a lesson — hence both relations are optional and at least one is set.
+  lessonId String?
+  moduleId String?
+  blockId  String?
+
+  // Denormalised so the favourites list renders without extra joins
+  label    String
+  excerpt  String?
+  note     String?
+
+  createdAt DateTime @default(now())
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lesson Lesson? @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  module Module? @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type])
+  @@index([userId, createdAt])
+  @@index([lessonId])
+  @@index([moduleId])
+}
+
+model SearchHistory {
+  id              String @id @default(cuid())
+  userId          String
+  query           String
+  normalizedQuery String
+  resultCount     Int    @default(0)
+
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([normalizedQuery])
+}
+
+// ─────────────────────────────────────────────────────────────
+// AI chatbot
+// ─────────────────────────────────────────────────────────────
+
+model ChatSession {
+  id       String  @id @default(cuid())
+  userId   String
+  // Lesson the conversation was started from, gives the AI its context
+  lessonId String?
+  title    String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user     User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lesson   Lesson?       @relation(fields: [lessonId], references: [id], onDelete: SetNull)
+  messages ChatMessage[]
+
+  @@index([userId, updatedAt])
+  @@index([lessonId])
+}
+
+model ChatMessage {
+  id        String @id @default(cuid())
+  sessionId String
+  // "USER" | "ASSISTANT" | "SYSTEM"
+  role      String
+  content   String
+  // Which adapter produced an assistant message (telemetry + provider switch)
+  provider  String?
+  model     String?
+  latencyMs Int?
+
+  createdAt DateTime @default(now())
+
+  session ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, createdAt])
+  @@index([role])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Admin-managed library
+// ─────────────────────────────────────────────────────────────
+
+model Media {
+  id           String  @id @default(cuid())
+  filename     String
+  originalName String
+  mimeType     String
+  size         Int
+  width        Int?
+  height       Int?
+  url          String
+  alt          String?
+
+  uploadedById String?
+  createdAt    DateTime @default(now())
+
+  uploadedBy User? @relation(fields: [uploadedById], references: [id], onDelete: SetNull)
+
+  @@index([mimeType])
+  @@index([createdAt])
+}
+
+model Faq {
+  id       String  @id @default(cuid())
+  // Global FAQs (help centre) leave this null; lesson FAQs attach to a lesson
+  lessonId String?
+  question String
+  answer   String
+  category String?
+  order    Int     @default(0)
+  isPublished Boolean @default(true)
+
+  searchText String @default("")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  lesson Lesson? @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+
+  @@index([lessonId])
+  @@index([category])
+}
+
+// Key/value store for site, chatbot and search configuration.
+// Editable from Admin → Settings so nothing needs redeploying.
+model Setting {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     Json
+  updatedAt DateTime @updatedAt
+}
+
+// Admin dashboard activity feed
+model ActivityLog {
+  id      String  @id @default(cuid())
+  userId  String?
+  // "LESSON_COMPLETED" | "QUIZ_PASSED" | "LOGIN" | "CONTENT_PUBLISHED" | ...
+  type    String
+  message String
+  metadata Json?
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@index([type])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Certificate
+// ─────────────────────────────────────────────────────────────
+
+model Certificate {
+  id     String @id @default(cuid())
+  // Public verification code embedded in the printed certificate and its URL.
+  code   String @unique
+  userId String
+
+  // Snapshot of what was achieved at issue time. Stored rather than derived so
+  // a certificate stays verifiable and printable exactly as awarded, even after
+  // the curriculum is edited.
+  studentName      String
+  courseTitle      String
+  lessonsCompleted Int    @default(0)
+  quizzesPassed    Int    @default(0)
+  averageScore     Int    @default(0)
+  totalMinutes     Int    @default(0)
+
+  issuedAt  DateTime  @default(now())
+  revokedAt DateTime?
+  revokeReason String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([code])
+  @@index([issuedAt])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Contact & course requests
+// ─────────────────────────────────────────────────────────────
+
+model ContactMessage {
+  id      String  @id @default(cuid())
+  name    String
+  email   String
+  phone   String?
+  subject String
+  message String
+
+  // Present when a signed-in learner sends the message
+  userId String?
+
+  // "NEW" | "READ" | "REPLIED" | "ARCHIVED"
+  status String @default("NEW")
+
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([createdAt])
+}
+
+model CourseRequest {
+  id          String  @id @default(cuid())
+  title       String
+  description String
+  category    String?
+  // "LOW" | "NORMAL" | "HIGH"
+  priority    String  @default("NORMAL")
+  name        String
+  email       String
+  userId      String?
+  // "NEW" | "PLANNED" | "IN_PROGRESS" | "DONE" | "DECLINED"
+  status      String  @default("NEW")
+  adminNote   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Password reset
+// ─────────────────────────────────────────────────────────────
+
+// A single-use, expiring link for choosing a new password. Applies to every
+// account (learners and administrators alike). The raw token only ever appears
+// in the emailed URL; the database stores its SHA-256 hash, mirroring Session.
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  token     String    @unique
+  userId    String
+  expiresAt DateTime
+  // Set the moment the token is redeemed, which is what makes it single-use.
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// ─────────────────────────────────────────────────────────────
+// Newsletter
+// ─────────────────────────────────────────────────────────────
+
+// Addresses collected from the footer form. Stored rather than sent anywhere:
+// the admin panel is the source of truth for who wants to hear about new
+// lessons, and nothing here is coupled to a mail provider.
+model NewsletterSubscriber {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+}
